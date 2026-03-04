@@ -22,12 +22,15 @@ def get_groq_client() -> OpenAI:
     )
 
 
-def generate(prompt: str) -> str:
+def generate(prompt: str, history: list[dict] = None) -> str:
     """Send a prompt to Groq and return the assistant reply text."""
     client = get_groq_client()
+    messages = list(history) if history else []
+    messages.append({"role": "user", "content": prompt})
+    
     response = client.chat.completions.create(
         model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
+        messages=messages,
         max_tokens=MAX_TOKENS,
         temperature=0.0,   # deterministic — best for RAG grounding
         stream=False,

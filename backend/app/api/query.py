@@ -9,6 +9,7 @@ router = APIRouter()
 
 class QueryRequest(BaseModel):
     question: str
+    history: list[dict] = []
 
 class QueryResponse(BaseModel):
     query: str
@@ -34,7 +35,7 @@ def query(req: QueryRequest):
 
     print("[AGENT] Running agentic pipeline (retrieve → evaluate → generate → hallucination check)...")
     t1 = time.time()
-    result = run_agent(req.question)
+    result = run_agent(req.question, req.history)
     print(f"[AGENT] Done in {time.time()-t1:.1f}s  |  status: {result['hallucination_status']}")
     print("="*60 + "\n")
 

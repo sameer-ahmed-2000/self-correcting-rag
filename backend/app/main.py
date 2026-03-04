@@ -23,7 +23,9 @@ app.include_router(query.router, prefix="/api/query", tags=["Query"])
 app.include_router(ingest.router, prefix="/api/ingest", tags=["Ingest"])
 app.include_router(evaluate.router, prefix="/api/evaluate", tags=["Evaluate"])
 
-
+@app.get("/")
+def root():
+    return {"message": "server working"}
 @app.get("/health")
 def health():
     return {"status": "ok"}

@@ -25,11 +25,13 @@ from app.core.llm import generate, build_rag_prompt, build_query_rewrite_prompt,
 
 class AgentState(TypedDict):
     query: str
+    history: list[dict]
     rewritten_query: Optional[str]
     retrieved_docs: list[dict]
     answer: str
     hallucination_status: str   # SUPPORTED | PARTIALLY_SUPPORTED | NOT_SUPPORTED
     retry_count: int
+    web_search_done: bool
     trace: list[str]            # step-by-step reasoning log
 
 
@@ -47,24 +49,54 @@ def retrieve(state: AgentState) -> AgentState:
     return state
 
 
-def evaluate_relevance(state: AgentState) -> Literal["generate", "rewrite"]:
+def evaluate_relevance(state: AgentState) -> Literal["generate", "rewrite", "web_search"]:
     docs = state["retrieved_docs"]
-    if not docs:
-        state["trace"].append("[EVALUATE] No documents retrieved → rewriting query")
-        return "rewrite"
-    top_score = docs[0]["score"]
-    if top_score < RELEVANCE_THRESHOLD and state["retry_count"] < MAX_RETRIES:
-        state["trace"].append(f"[EVALUATE] Top score {top_score:.3f} < threshold {RELEVANCE_THRESHOLD} → rewriting query")
-        return "rewrite"
+    top_score = docs[0]["score"] if docs else 0.0
+
+    if not docs or top_score < RELEVANCE_THRESHOLD:
+        if state["retry_count"] < MAX_RETRIES:
+            state["trace"].append(f"[EVALUATE] Score {top_score:.3f} < threshold {RELEVANCE_THRESHOLD} → rewriting query")
+            return "rewrite"
+        elif not state.get("web_search_done"):
+            state["trace"].append(f"[EVALUATE] Score {top_score:.3f} < threshold {RELEVANCE_THRESHOLD} after retries → web search fallback")
+            return "web_search"
+
     state["trace"].append(f"[EVALUATE] Relevance OK (score: {top_score:.3f}) → generating answer")
     return "generate"
+
+def web_search_node(state: AgentState) -> AgentState:
+    state["web_search_done"] = True
+    q = state.get("rewritten_query") or state["query"]
+    state["trace"].append(f"[WEB_SEARCH] Searching DuckDuckGo for: '{q}'")
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(q, max_results=3))
+        docs = []
+        for r in results:
+            docs.append({
+                "title": r.get("title", ""),
+                "text": r.get("body", ""),
+                "source": r.get("href", ""),
+                "score": 1.0
+            })
+        state["retrieved_docs"] = docs
+        if docs:
+            state["trace"].append(f"[WEB_SEARCH] Found {len(docs)} external sources")
+        else:
+            state["trace"].append("[WEB_SEARCH] No external sources found")
+    except Exception as e:
+        state["trace"].append(f"[WEB_SEARCH] Search failed: {str(e)}")
+        state["retrieved_docs"] = []
+    
+    return state
 
 
 def rewrite_query(state: AgentState) -> AgentState:
     state["retry_count"] += 1
     current_answer = state.get("answer", "No answer yet.")
     prompt = build_query_rewrite_prompt(state["query"], current_answer)
-    rewritten = generate(prompt)
+    rewritten = generate(prompt, history=state.get("history", []))
     # Clean up — take only the first line
     rewritten = rewritten.strip().split("\n")[0]
     state["rewritten_query"] = rewritten
@@ -74,7 +106,7 @@ def rewrite_query(state: AgentState) -> AgentState:
 
 def generate_answer(state: AgentState) -> AgentState:
     prompt = build_rag_prompt(state["query"], state["retrieved_docs"])
-    answer = generate(prompt)
+    answer = generate(prompt, history=state.get("history", []))
     state["answer"] = answer
     state["trace"].append(f"[GENERATE] Answer produced ({len(answer)} chars)")
     return state
@@ -96,10 +128,15 @@ def check_hallucination(state: AgentState) -> AgentState:
     return state
 
 
-def should_retry_after_hallucination(state: AgentState) -> Literal["retrieve", "__end__"]:
-    if state["hallucination_status"] == "NOT_SUPPORTED" and state["retry_count"] < MAX_RETRIES:
-        state["trace"].append("[DECISION] Answer not supported → retrying with rewritten query")
-        return "retrieve"
+def should_retry_after_hallucination(state: AgentState) -> Literal["retrieve", "web_search", "__end__"]:
+    # If the LLM said it doesn't have enough info, or the answer is ungrounded
+    if state["hallucination_status"] == "NOT_SUPPORTED" or "don't have enough information" in state["answer"].lower():
+        if state["retry_count"] < MAX_RETRIES:
+            state["trace"].append("[DECISION] Answer not supported → retrying with rewritten query")
+            return "retrieve"
+        elif not state.get("web_search_done"):
+            state["trace"].append("[DECISION] Answer not supported after retries → trying web search")
+            return "web_search"
     state["trace"].append("[DECISION] Finalising answer")
     return "__end__"
 
@@ -111,6 +148,7 @@ def build_graph() -> StateGraph:
 
     g.add_node("retrieve", retrieve)
     g.add_node("rewrite_query", rewrite_query)
+    g.add_node("web_search", web_search_node)
     g.add_node("generate_answer", generate_answer)
     g.add_node("check_hallucination", check_hallucination)
 
@@ -119,14 +157,15 @@ def build_graph() -> StateGraph:
     g.add_conditional_edges(
         "retrieve",
         evaluate_relevance,
-        {"generate": "generate_answer", "rewrite": "rewrite_query"},
+        {"generate": "generate_answer", "rewrite": "rewrite_query", "web_search": "web_search"},
     )
     g.add_edge("rewrite_query", "retrieve")
+    g.add_edge("web_search", "generate_answer")
     g.add_edge("generate_answer", "check_hallucination")
     g.add_conditional_edges(
         "check_hallucination",
         should_retry_after_hallucination,
-        {"retrieve": "rewrite_query", "__end__": END},
+        {"retrieve": "rewrite_query", "web_search": "web_search", "__end__": END},
     )
 
     return g.compile()
@@ -141,15 +180,17 @@ def get_graph():
     return _graph
 
 
-def run_agent(query: str) -> dict:
+def run_agent(query: str, history: list[dict] = None) -> dict:
     graph = get_graph()
     initial_state: AgentState = {
         "query": query,
+        "history": history or [],
         "rewritten_query": None,
         "retrieved_docs": [],
         "answer": "",
         "hallucination_status": "",
         "retry_count": 0,
+        "web_search_done": False,
         "trace": [],
     }
     final_state = graph.invoke(initial_state)
