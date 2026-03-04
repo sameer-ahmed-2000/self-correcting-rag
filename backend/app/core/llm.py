@@ -2,40 +2,56 @@
 LLM wrapper connecting to Groq's OpenAI-compatible endpoint.
 """
 import os
+import asyncio
 from functools import lru_cache
-
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 MAX_TOKENS   = int(os.getenv("MAX_TOKENS", "512"))
 
 
 @lru_cache(maxsize=1)
-def get_groq_client() -> OpenAI:
+def get_async_groq_client() -> AsyncOpenAI:
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY environment variable is not set.")
     print(f"[LLM] Using Groq model: {GROQ_MODEL}")
-    return OpenAI(
+    return AsyncOpenAI(
         api_key=GROQ_API_KEY,
         base_url="https://api.groq.com/openai/v1",
     )
 
 
-def generate(prompt: str, history: list[dict] = None) -> str:
-    """Send a prompt to Groq and return the assistant reply text."""
-    client = get_groq_client()
+async def agenerate(prompt: str, history: list[dict] = None, token_queue: asyncio.Queue = None) -> str:
+    """Send a prompt to Groq and return / stream the assistant reply text."""
+    client = get_async_groq_client()
     messages = list(history) if history else []
     messages.append({"role": "user", "content": prompt})
     
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=messages,
-        max_tokens=MAX_TOKENS,
-        temperature=0.0,   # deterministic — best for RAG grounding
-        stream=False,
-    )
-    return response.choices[0].message.content.strip()
+    if token_queue:
+        response = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            max_tokens=MAX_TOKENS,
+            temperature=0.0,
+            stream=True,
+        )
+        full_text = ""
+        async for chunk in response:
+            content = chunk.choices[0].delta.content
+            if content:
+                full_text += content
+                await token_queue.put({"type": "token", "content": content})
+        return full_text.strip()
+    else:
+        response = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            max_tokens=MAX_TOKENS,
+            temperature=0.0,
+            stream=False,
+        )
+        return response.choices[0].message.content.strip()
 
 
 # ── Prompt builders (unchanged) ───────────────────────────────────────────────

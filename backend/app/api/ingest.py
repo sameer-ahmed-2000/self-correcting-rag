@@ -4,7 +4,11 @@ Ingest Wikipedia articles into the FAISS vector store.
 Chunks articles into ~300-word paragraphs with overlap.
 """
 import re
-from fastapi import APIRouter, HTTPException
+import io
+import requests
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 import wikipedia
 from app.core.vector_store import add_documents
@@ -45,6 +49,9 @@ def chunk_text(text: str, title: str, source: str) -> list[dict]:
 class IngestRequest(BaseModel):
     topics: list[str] | None = None   # defaults to DEFAULT_TOPICS
 
+class UrlIngestRequest(BaseModel):
+    urls: list[str]
+
 
 class IngestResponse(BaseModel):
     status: str
@@ -78,6 +85,80 @@ def ingest_wikipedia(req: IngestRequest = IngestRequest()):
                 errors.append(f"{topic}: {str(inner)}")
         except Exception as e:
             errors.append(f"{topic}: {str(e)}")
+
+    if all_chunks:
+        add_documents(all_chunks)
+
+    return {
+        "status": "success" if not errors else "partial",
+        "topics_ingested": ingested,
+        "chunks_added": len(all_chunks),
+        "errors": errors,
+    }
+
+
+@router.post("/url", response_model=IngestResponse)
+def ingest_url(req: UrlIngestRequest):
+    all_chunks = []
+    errors = []
+    ingested = []
+
+    for url in req.urls:
+        try:
+            response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            # Remove nav, footer, script, style noise
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                tag.decompose()
+            text = soup.get_text(separator=' ', strip=True)
+            # Collapse whitespace and cap to 50k chars (≈ ~7,000 words)
+            import re as _re
+            text = _re.sub(r'\s+', ' ', text).strip()[:50_000]
+            title = soup.title.string.strip() if soup.title and soup.title.string else url
+            chunks = chunk_text(text, title=title, source=url)
+            all_chunks.extend(chunks)
+            ingested.append(url)
+            print(f"  ✓ {url} → {len(chunks)} chunks")
+        except Exception as e:
+            errors.append(f"{url}: {str(e)}")
+
+    if all_chunks:
+        add_documents(all_chunks)
+
+    return {
+        "status": "success" if not errors else "partial",
+        "topics_ingested": ingested,
+        "chunks_added": len(all_chunks),
+        "errors": errors,
+    }
+
+
+@router.post("/pdf", response_model=IngestResponse)
+async def ingest_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    
+    all_chunks = []
+    errors = []
+    ingested = []
+
+    try:
+        content = await file.read()
+        pdf = PdfReader(io.BytesIO(content))
+        text = ""
+        for page in pdf.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text += extracted + "\n"
+        
+        title = file.filename
+        chunks = chunk_text(text, title=title, source=f"local-pdf:{title}")
+        all_chunks.extend(chunks)
+        ingested.append(title)
+        print(f"  ✓ {title} → {len(chunks)} chunks")
+    except Exception as e:
+        errors.append(f"{file.filename}: {str(e)}")
 
     if all_chunks:
         add_documents(all_chunks)

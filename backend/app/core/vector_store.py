@@ -3,6 +3,7 @@ Core vector store management using FAISS + HuggingFace sentence-transformers.
 Embedding model: all-MiniLM-L6-v2 (fast, lightweight, no API key needed)
 """
 import os
+import sys
 import pickle
 from pathlib import Path
 from typing import List, Tuple
@@ -40,16 +41,32 @@ def load_index() -> Tuple[faiss.IndexFlatIP, List[dict]]:
         if not INDEX_PATH.exists():
             raise FileNotFoundError("FAISS index not found. Please ingest documents first via /api/ingest/wikipedia.")
         _index = faiss.read_index(str(INDEX_PATH))
-        with open(DOCS_PATH, "rb") as f:
-            _documents = pickle.load(f)
+        try:
+            with open(DOCS_PATH, "rb") as f:
+                _documents = pickle.load(f)
+        except (EOFError, pickle.UnpicklingError, Exception):
+            # Corrupted docs file — reset documents to be consistent with index
+            print("[WARN] documents.pkl is corrupted. Resetting document store.")
+            _documents = []
+            _index = None
+            # Delete the broken files so next ingest starts fresh
+            INDEX_PATH.unlink(missing_ok=True)
+            DOCS_PATH.unlink(missing_ok=True)
+            raise FileNotFoundError("Data files were corrupted and have been cleared. Please re-ingest your documents.")
     return _index, _documents
 
 
 def save_index(index: faiss.IndexFlatIP, documents: List[dict]) -> None:
     INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
     faiss.write_index(index, str(INDEX_PATH))
-    with open(DOCS_PATH, "wb") as f:
-        pickle.dump(documents, f)
+    # Raise recursion limit temporarily for large document lists
+    old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(10000)
+    try:
+        with open(DOCS_PATH, "wb") as f:
+            pickle.dump(documents, f, protocol=pickle.HIGHEST_PROTOCOL)
+    finally:
+        sys.setrecursionlimit(old_limit)
 
 
 def add_documents(chunks: List[dict]) -> None:

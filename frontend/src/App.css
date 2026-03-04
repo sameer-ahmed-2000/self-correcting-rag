@@ -679,3 +679,29 @@ body {
   opacity: 0.2;
   cursor: not-allowed;
 }
+
+/* Streaming effects */
+.cursor-blink {
+  display: inline-block;
+  animation: blink 0.7s step-end infinite;
+  color: var(--accent);
+  font-weight: bold;
+  line-height: 1;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.stream-trace-live {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
