@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
-const API = "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 const EXAMPLES = [
     "What is retrieval-augmented generation?",
@@ -9,22 +9,77 @@ const EXAMPLES = [
 ];
 
 export default function ChatInterface() {
+    const [sessions, setSessions] = useState([]);     // sidebar list
+    const [activeSessionId, setActiveSessionId] = useState(null);
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState("");
     const [loading, setLoading] = useState(false);
+    const [sidebarOpen, setSidebarOpen] = useState(true);
     const messagesEndRef = useRef(null);
+
+    // ── Load sessions list on mount ──────────────────────────────
+    const fetchSessions = useCallback(async () => {
+        try {
+            const res = await fetch(`${API}/api/sessions/`);
+            if (res.ok) setSessions(await res.json());
+        } catch { /* ignore */ }
+    }, []);
+
+    useEffect(() => { fetchSessions(); }, [fetchSessions]);
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }, [messages]);
 
+    // ── Load a past session ──────────────────────────────────────
+    async function loadSession(sessionId) {
+        setActiveSessionId(sessionId);
+        setMessages([]);
+        setLoading(false);
+        try {
+            const res = await fetch(`${API}/api/sessions/${sessionId}/messages`);
+            if (!res.ok) return;
+            const data = await res.json();
+            const loaded = data.map(m => ({
+                role: m.role,
+                content: m.role === "user" ? m.content : undefined,
+                settled: true,
+                streaming: false,
+                streamText: m.role === "assistant" ? m.content : undefined,
+                raw: m.role === "assistant" && m.metadata ? {
+                    answer: m.content,
+                    ...m.metadata,
+                } : null,
+                traceSteps: m.metadata?.trace || [],
+                rewrittenQuery: m.metadata?.rewritten_query || null,
+            }));
+            setMessages(loaded);
+        } catch { /* ignore */ }
+    }
+
+    // ── New chat ─────────────────────────────────────────────────
+    function startNewChat() {
+        setActiveSessionId(null);
+        setMessages([]);
+        setInput("");
+    }
+
+    async function deleteSession(e, sessionId) {
+        e.stopPropagation();
+        await fetch(`${API}/api/sessions/${sessionId}`, { method: "DELETE" });
+        if (activeSessionId === sessionId) startNewChat();
+        fetchSessions();
+    }
+
+    // ── Submit ───────────────────────────────────────────────────
     async function handleSubmit(q = input) {
         const question = q.trim();
         if (!question || loading) return;
 
-        const newUserMsg = { role: "user", content: question };
+        setMessages(prev => [...prev, { role: "user", content: question, settled: true }]);
+        setInput("");
+        setLoading(true);
 
-        // Build history for backend from settled (non-streaming) messages
         const historyForBackend = messages
             .filter(m => m.settled)
             .map(m => ({
@@ -32,29 +87,17 @@ export default function ChatInterface() {
                 content: m.role === "assistant" ? (m.raw?.answer || m.streamText || "") : m.content,
             }));
 
-        setMessages(prev => [...prev, newUserMsg]);
-        setInput("");
-        setLoading(true);
-
-        // Add a placeholder streaming assistant message
-        const assistantPlaceholder = {
-            role: "assistant",
-            streaming: true,
-            settled: false,
-            streamText: "",
-            traceSteps: [],
-            rewrittenQuery: null,
-            raw: null,
-        };
-        setMessages(prev => [...prev, assistantPlaceholder]);
+        setMessages(prev => [...prev, {
+            role: "assistant", streaming: true, settled: false,
+            streamText: "", traceSteps: [], rewrittenQuery: null, raw: null,
+        }]);
 
         try {
             const res = await fetch(`${API}/api/query/`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ question, history: historyForBackend }),
+                body: JSON.stringify({ question, history: historyForBackend, session_id: activeSessionId }),
             });
-
             if (!res.ok) throw new Error(`Server error: ${res.status}`);
 
             const reader = res.body.getReader();
@@ -66,105 +109,123 @@ export default function ChatInterface() {
                 if (done) break;
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split("\n");
-                buffer = lines.pop(); // keep incomplete last line
-
+                buffer = lines.pop();
                 for (const line of lines) {
                     if (!line.startsWith("data: ")) continue;
                     try {
                         const event = JSON.parse(line.slice(6));
-                        handleStreamEvent(event);
-                    } catch { /* skip malformed */ }
+                        if (event.type === "session") {
+                            setActiveSessionId(event.session_id);
+                            if (event.is_new) fetchSessions();
+                        } else {
+                            handleStreamEvent(event);
+                        }
+                    } catch { /* skip */ }
                 }
             }
         } catch (e) {
             setMessages(prev => {
                 const updated = [...prev];
-                const lastIdx = updated.length - 1;
-                updated[lastIdx] = { ...updated[lastIdx], streaming: false, settled: true, error: e.message };
+                updated[updated.length - 1] = { ...updated[updated.length - 1], streaming: false, settled: true, error: e.message };
                 return updated;
             });
         } finally {
             setLoading(false);
+            fetchSessions(); // refresh sidebar timestamps
         }
     }
 
     function handleStreamEvent(event) {
         setMessages(prev => {
             const updated = [...prev];
-            const lastIdx = updated.length - 1;
-            const last = { ...updated[lastIdx] };
-
-            if (event.type === "trace") {
-                last.traceSteps = [...(last.traceSteps || []), event.content];
-            } else if (event.type === "rewrite") {
-                last.rewrittenQuery = event.content;
-            } else if (event.type === "clear_tokens") {
-                last.streamText = "";
-            } else if (event.type === "token") {
-                last.streamText = (last.streamText || "") + event.content;
-            } else if (event.type === "end") {
-                last.streaming = false;
-                last.settled = true;
-                last.raw = event.result;
-                last.streamText = event.result.answer;
-            }
-
-            updated[lastIdx] = last;
+            const last = { ...updated[updated.length - 1] };
+            if (event.type === "trace") last.traceSteps = [...(last.traceSteps || []), event.content];
+            else if (event.type === "rewrite") last.rewrittenQuery = event.content;
+            else if (event.type === "clear_tokens") last.streamText = "";
+            else if (event.type === "token") last.streamText = (last.streamText || "") + event.content;
+            else if (event.type === "end") { last.streaming = false; last.settled = true; last.raw = event.result; last.streamText = event.result.answer; }
+            updated[updated.length - 1] = last;
             return updated;
         });
     }
 
     return (
-        <div className="chat-container">
-            <div className="chat-messages">
-                {messages.length === 0 && (
-                    <div className="chat-empty">
-                        <span className="chat-empty-icon">⬡</span>
-                        <h2>Self-Correcting RAG Chat</h2>
-                        <p className="muted">Ask any research question. The agent retrieves, evaluates, and verifies its own facts automatically.</p>
-                        <div className="examples chat-examples">
-                            {EXAMPLES.map(ex => (
-                                <button key={ex} className="example-pill" onClick={() => handleSubmit(ex)}>{ex}</button>
-                            ))}
+        <div className="chat-layout">
+            {/* ── Sidebar ──────────────────────────── */}
+            <aside className={`chat-sidebar ${sidebarOpen ? "open" : "closed"}`}>
+                <div className="sidebar-header">
+                    <button className="new-chat-btn" onClick={startNewChat}>+ New Chat</button>
+                    <button className="sidebar-toggle" onClick={() => setSidebarOpen(!sidebarOpen)} title="Toggle sidebar">☰</button>
+                </div>
+                <div className="session-list">
+                    {sessions.map(s => (
+                        <div
+                            key={s.id}
+                            className={`session-item ${activeSessionId === s.id ? "active" : ""}`}
+                            onClick={() => loadSession(s.id)}
+                        >
+                            <span className="session-title">{s.title}</span>
+                            <button
+                                className="session-delete"
+                                onClick={e => deleteSession(e, s.id)}
+                                title="Delete"
+                            >✕</button>
                         </div>
-                    </div>
+                    ))}
+                    {sessions.length === 0 && (
+                        <p className="sidebar-empty">No chats yet. Ask something!</p>
+                    )}
+                </div>
+            </aside>
+
+            {/* ── Main chat area ───────────────────── */}
+            <div className="chat-container">
+                {!sidebarOpen && (
+                    <button className="sidebar-toggle floating" onClick={() => setSidebarOpen(true)} title="Open sidebar">☰</button>
                 )}
 
-                {messages.map((m, idx) => (
-                    <div key={idx} className={`chat-message ${m.role}`}>
-                        <div className="chat-avatar">{m.role === "user" ? "You" : "⬡"}</div>
-                        <div className="chat-content">
-                            {m.role === "user"
-                                ? <div className="user-text">{m.content}</div>
-                                : m.error
-                                    ? <div className="error-box">⚠ {m.error}</div>
-                                    : <AssistantBubble msg={m} />
-                            }
+                <div className="chat-messages">
+                    {messages.length === 0 && (
+                        <div className="chat-empty">
+                            <span className="chat-empty-icon">⬡</span>
+                            <h2>Self-Correcting RAG</h2>
+                            <p className="muted">Ask any research question. The agent retrieves, evaluates, and verifies facts automatically.</p>
+                            <div className="examples chat-examples">
+                                {EXAMPLES.map(ex => (
+                                    <button key={ex} className="example-pill" onClick={() => handleSubmit(ex)}>{ex}</button>
+                                ))}
+                            </div>
                         </div>
-                    </div>
-                ))}
-                <div ref={messagesEndRef} />
-            </div>
+                    )}
 
-            <div className="chat-input-wrapper">
-                <div className="chat-input-area">
-                    <textarea
-                        className="chat-input"
-                        value={input}
-                        onChange={e => setInput(e.target.value)}
-                        placeholder="Message Agentic RAG…"
-                        rows={1}
-                        onKeyDown={e => {
-                            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSubmit(); }
-                        }}
-                    />
-                    <button
-                        className="chat-send-btn"
-                        onClick={() => handleSubmit()}
-                        disabled={loading || !input.trim()}
-                    >
-                        ↑
-                    </button>
+                    {messages.map((m, idx) => (
+                        <div key={idx} className={`chat-message ${m.role}`}>
+                            <div className="chat-avatar">{m.role === "user" ? "You" : "⬡"}</div>
+                            <div className="chat-content">
+                                {m.role === "user"
+                                    ? <div className="user-text">{m.content}</div>
+                                    : m.error
+                                        ? <div className="error-box">⚠ {m.error}</div>
+                                        : <AssistantBubble msg={m} />
+                                }
+                            </div>
+                        </div>
+                    ))}
+                    <div ref={messagesEndRef} />
+                </div>
+
+                <div className="chat-input-wrapper">
+                    <div className="chat-input-area">
+                        <textarea
+                            className="chat-input"
+                            value={input}
+                            onChange={e => setInput(e.target.value)}
+                            placeholder="Message Agentic RAG…"
+                            rows={1}
+                            onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSubmit(); } }}
+                        />
+                        <button className="chat-send-btn" onClick={() => handleSubmit()} disabled={loading || !input.trim()}>↑</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -173,20 +234,13 @@ export default function ChatInterface() {
 
 function AssistantBubble({ msg }) {
     const [showTrace, setShowTrace] = useState(false);
-
-    const statusColor = {
-        SUPPORTED: "#4ade80",
-        PARTIALLY_SUPPORTED: "#facc15",
-        NOT_SUPPORTED: "#f87171",
-    };
-
+    const statusColor = { SUPPORTED: "#4ade80", PARTIALLY_SUPPORTED: "#facc15", NOT_SUPPORTED: "#f87171" };
     const status = msg.raw?.hallucination_status;
     const sources = msg.raw?.sources || [];
     const trace = msg.raw?.trace || msg.traceSteps || [];
 
     return (
         <div className="assistant-msg-inner">
-            {/* Live trace steps while streaming */}
             {msg.streaming && msg.traceSteps?.length > 0 && (
                 <div className="stream-trace-live">
                     {msg.traceSteps.map((s, i) => {
@@ -202,39 +256,25 @@ function AssistantBubble({ msg }) {
                     })}
                 </div>
             )}
-
-            {/* Rewritten query info */}
             {msg.rewrittenQuery && (
-                <div className="chat-rewritten">
-                    <span className="muted">Searched for: </span>
-                    <em>"{msg.rewrittenQuery}"</em>
-                </div>
+                <div className="chat-rewritten"><span className="muted">Searched for: </span><em>"{msg.rewrittenQuery}"</em></div>
             )}
-
-            {/* The main answer — streams word by word */}
             <div className="chat-answer">
                 {msg.streamText || ""}
                 {msg.streaming && <span className="cursor-blink">▋</span>}
             </div>
-
-            {/* Meta bar shown after streaming finishes */}
             {!msg.streaming && msg.settled && (
                 <div className="chat-meta">
                     <button className="toggle-trace-btn" onClick={() => setShowTrace(!showTrace)}>
                         {showTrace ? "Hide Agent Trace ↑" : "View Agent Trace ↓"}
                     </button>
                     {status && (
-                        <span
-                            className="status-badge"
-                            style={{ background: statusColor[status] + "22", color: statusColor[status], border: `1px solid ${statusColor[status]}44` }}
-                        >
+                        <span className="status-badge" style={{ background: statusColor[status] + "22", color: statusColor[status], border: `1px solid ${statusColor[status]}44` }}>
                             {status}
                         </span>
                     )}
                 </div>
             )}
-
-            {/* Expandable trace panel */}
             {showTrace && (
                 <div className="chat-trace-box">
                     {sources.length > 0 && (
