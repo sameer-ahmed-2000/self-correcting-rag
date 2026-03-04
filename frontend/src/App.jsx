@@ -1,12 +1,10 @@
 import { useState } from "react";
-import QueryPanel from "./components/QueryPanel";
-import IngestPanel from "./components/IngestPanel";
-import TraceViewer from "./components/TraceViewer";
 import "./App.css";
+import ChatInterface from "./components/ChatInterface";
+import IngestPanel from "./components/IngestPanel";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState("query");
-  const [lastResult, setLastResult] = useState(null);
+  const [activeTab, setActiveTab] = useState("chat");
 
   return (
     <div className="app">
@@ -17,27 +15,23 @@ export default function App() {
             <span className="logo-text">Agentic RAG <span>Research Assistant</span></span>
           </div>
           <nav className="tabs">
-            {["query", "ingest", "trace"].map((tab) => (
+            {["chat", "ingest"].map((tab) => (
               <button
                 key={tab}
                 className={`tab ${activeTab === tab ? "active" : ""}`}
                 onClick={() => setActiveTab(tab)}
               >
-                {tab === "query" && "🔍 Ask"}
+                {tab === "chat" && "💬 Chat"}
                 {tab === "ingest" && "📥 Ingest"}
-                {tab === "trace" && "🔬 Trace"}
               </button>
             ))}
           </nav>
         </div>
       </header>
 
-      <main className="main">
-        {activeTab === "query" && (
-          <QueryPanel onResult={(r) => { setLastResult(r); setActiveTab("trace"); }} />
-        )}
+      <main className="main" style={{ height: 'calc(100vh - 60px)', padding: '1rem', display: 'flex', flexDirection: 'column' }}>
+        {activeTab === "chat" && <ChatInterface />}
         {activeTab === "ingest" && <IngestPanel />}
-        {activeTab === "trace" && <TraceViewer result={lastResult} onBack={() => setActiveTab("query")} />}
       </main>
     </div>
   );
